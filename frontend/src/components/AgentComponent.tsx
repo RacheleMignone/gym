@@ -1,0 +1,356 @@
+import React, { CSSProperties, useEffect, useMemo, useState, useRef } from "react";
+
+interface Props {
+  id: string;
+  "agent-name"?: string;
+  "agent-title"?: string;
+  styles?: CSSProperties;
+}
+
+export const AgentComponent: React.FC<Props> = ({
+  id,
+  "agent-name": agentName = "",
+  "agent-title": agentTitle = "BESSER Agent",
+  styles,
+}) => {
+  const [messages, setMessages] = useState<Array<{ text: string; sender: "user" | "agent"; timestamp: Date }>>([]);
+  const [inputMessage, setInputMessage] = useState("");
+  const [isConnected, setIsConnected] = useState(false);
+  const [isConnecting, setIsConnecting] = useState(false);
+  const wsRef = useRef<WebSocket | null>(null);
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  // GUI components store ``agent-name`` verbatim from the diagram title (e.g.
+  // "Library Agent"), but BUML Agent names — and therefore the JSON map keys
+  // — are Python-safe identifiers ("Library_Agent"). We do one normalization:
+  // space→underscore. Backend emits exactly one canonical key per agent, so
+  // this lookup is deterministic.
+  const agentUrl = useMemo(() => {
+    const raw = import.meta.env.VITE_AGENT_URLS as string | undefined;
+    if (raw && agentName) {
+      try {
+        const parsed = JSON.parse(raw);
+        if (parsed && typeof parsed === "object") {
+          const key = agentName in parsed ? agentName : agentName.replace(/\s+/g, "_");
+          if (parsed[key]) {
+            return parsed[key] as string;
+          }
+        }
+      } catch {
+        // Fall through to the single-URL variable if the map can't be parsed.
+      }
+    }
+    return import.meta.env.VITE_AGENT_URL || "ws://localhost:8765";
+  }, [agentName]);
+
+  useEffect(() => {
+    // Auto-reconnect with linear-then-capped backoff. Needed because Render
+    // free-tier services sleep after 15 min of idle and take 1–5 minutes to
+    // cold-start (classical intent classifiers retrain on every boot). Without
+    // a retry loop, the first WebSocket attempt during a cold start fails
+    // immediately and the component stays "Disconnected" until the user
+    // manually refreshes.
+    //
+    // Schedule: 2s, 4s, 6s, ... capped at 30s per attempt. Up to 60 attempts
+    // (~26 min total) before we give up — comfortably longer than any real
+    // BAF cold start. ``cancelled`` flips on cleanup so we stop retrying
+    // after unmount (including React strict-mode double-mount).
+    let cancelled = false;
+    let retry = 0;
+    let retryTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const connect = () => {
+      if (cancelled) return;
+      setIsConnecting(true);
+
+      let ws: WebSocket;
+      try {
+        ws = new WebSocket(agentUrl);
+      } catch (error) {
+        console.error("Failed to open WebSocket:", error);
+        scheduleRetry();
+        return;
+      }
+      wsRef.current = ws;
+
+      ws.onopen = () => {
+        retry = 0;
+        setIsConnected(true);
+        setIsConnecting(false);
+        console.log("Connected to agent:", agentName, "at", agentUrl);
+      };
+
+      ws.onmessage = (event) => {
+        console.log("Received message from agent:", event.data);
+        try {
+          const payload = JSON.parse(event.data);
+          // Handle BESSER agent message format
+          // Expected format: { action: 'agent_reply_str', message: '...' }
+          let messageText = '';
+
+          if (payload.action === 'agent_reply_str' && payload.message) {
+            messageText = payload.message;
+          } else if (payload.action === 'agent_reply_markdown' && payload.message) {
+            messageText = payload.message;
+          } else if (payload.action === 'agent_reply_html' && payload.message) {
+            messageText = payload.message;
+          } else if (payload.message) {
+            // Fallback to just the message field
+            messageText = payload.message;
+          } else {
+            // If no recognized format, stringify the whole payload
+            messageText = JSON.stringify(payload);
+          }
+
+          setMessages((prev) => [
+            ...prev,
+            {
+              text: messageText,
+              sender: "agent",
+              timestamp: new Date(),
+            },
+          ]);
+        } catch (error) {
+          // If not JSON, treat as plain text
+          console.log("Message is not JSON, treating as plain text");
+          setMessages((prev) => [
+            ...prev,
+            {
+              text: event.data,
+              sender: "agent",
+              timestamp: new Date(),
+            },
+          ]);
+        }
+      };
+
+      ws.onerror = (error) => {
+        console.error("WebSocket error:", error);
+      };
+
+      ws.onclose = (event) => {
+        setIsConnected(false);
+        console.log(
+          "Disconnected from agent. Code:",
+          event.code,
+          "Reason:",
+          event.reason,
+          "Clean:",
+          event.wasClean,
+        );
+        if (!cancelled) {
+          scheduleRetry();
+        } else {
+          setIsConnecting(false);
+        }
+      };
+    };
+
+    const scheduleRetry = () => {
+      retry += 1;
+      if (retry > 60) {
+        // Give up after ~30 minutes of backoff — well past any realistic cold start.
+        setIsConnecting(false);
+        return;
+      }
+      const delay = Math.min(30000, 2000 * retry);
+      setIsConnecting(true);
+      retryTimer = setTimeout(connect, delay);
+    };
+
+    connect();
+
+    return () => {
+      cancelled = true;
+      if (retryTimer) clearTimeout(retryTimer);
+      if (wsRef.current) {
+        wsRef.current.close();
+        wsRef.current = null;
+      }
+    };
+  }, [agentName, agentUrl]);
+
+  // Scroll to bottom when new messages arrive
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages]);
+
+  const sendMessage = () => {
+    if (!inputMessage.trim() || !wsRef.current || !isConnected) {
+      console.log("Cannot send message:", { 
+        hasMessage: !!inputMessage.trim(), 
+        hasWs: !!wsRef.current, 
+        isConnected,
+        readyState: wsRef.current?.readyState 
+      });
+      return;
+    }
+
+    // Add user message to chat
+    setMessages((prev) => [
+      ...prev,
+      {
+        text: inputMessage,
+        sender: "user",
+        timestamp: new Date(),
+      },
+    ]);
+
+    // Send message to agent via WebSocket
+    try {
+      console.log("Sending message to agent:", inputMessage, "ReadyState:", wsRef.current.readyState);
+      // BESSER framework expects this exact format
+      const messagePayload = JSON.stringify({
+        action: 'user_message',
+        message: inputMessage
+      });
+      wsRef.current.send(messagePayload);
+      console.log("Message sent successfully:", messagePayload);
+    } catch (error) {
+      console.error("Failed to send message:", error);
+    }
+
+    setInputMessage("");
+  };
+
+  const handleKeyPress = (e: React.KeyboardEvent) => {
+    if (e.key === "Enter" && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage();
+    }
+  };
+
+  const containerStyle: CSSProperties = {
+    width: styles?.width || "100%",
+    height: styles?.height || "500px",
+    border: "1px solid #ddd",
+    borderRadius: "8px",
+    display: "flex",
+    flexDirection: "column",
+    backgroundColor: "#fff",
+    ...styles,
+  };
+
+  const headerStyle: CSSProperties = {
+    padding: "15px",
+    borderBottom: "1px solid #ddd",
+    backgroundColor: "#f5f5f5",
+    borderRadius: "8px 8px 0 0",
+    display: "flex",
+    alignItems: "center",
+    justifyContent: "space-between",
+  };
+
+  const statusStyle: CSSProperties = {
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    fontSize: "12px",
+    color: isConnected ? "#27ae60" : isConnecting ? "#f39c12" : "#e74c3c",
+  };
+
+  const messagesStyle: CSSProperties = {
+    flex: 1,
+    overflowY: "auto",
+    padding: "15px",
+    display: "flex",
+    flexDirection: "column",
+    gap: "10px",
+  };
+
+  const messageStyle = (sender: "user" | "agent"): CSSProperties => ({
+    padding: "10px 15px",
+    borderRadius: "12px",
+    maxWidth: "70%",
+    wordWrap: "break-word",
+    alignSelf: sender === "user" ? "flex-end" : "flex-start",
+    backgroundColor: sender === "user" ? "#007bff" : "#e9ecef",
+    color: sender === "user" ? "#fff" : "#333",
+  });
+
+  const inputContainerStyle: CSSProperties = {
+    padding: "15px",
+    borderTop: "1px solid #ddd",
+    display: "flex",
+    gap: "10px",
+  };
+
+  const inputStyle: CSSProperties = {
+    flex: 1,
+    padding: "10px",
+    border: "1px solid #ddd",
+    borderRadius: "6px",
+    fontSize: "14px",
+  };
+
+  const buttonStyle: CSSProperties = {
+    padding: "10px 20px",
+    backgroundColor: "#007bff",
+    color: "#fff",
+    border: "none",
+    borderRadius: "6px",
+    cursor: isConnected ? "pointer" : "not-allowed",
+    fontSize: "14px",
+    opacity: isConnected ? 1 : 0.6,
+  };
+
+  return (
+    <div id={id} style={containerStyle}>
+      {/* Header */}
+      <div style={headerStyle}>
+        <div style={{ display: "flex", alignItems: "center", gap: "10px" }}>
+          <img 
+            src="/img/agent_back.png" 
+            alt="Agent" 
+            style={{ 
+              width: "32px", 
+              height: "32px", 
+              borderRadius: "50%",
+              objectFit: "contain",
+            }} 
+          />
+          <h3 style={{ margin: 0, fontSize: "18px" }}>{agentTitle}</h3>
+        </div>
+        <div style={statusStyle}>
+          <span>{isConnected ? "●" : "○"}</span>
+          <span>{isConnected ? "Connected" : isConnecting ? "Connecting..." : "Disconnected"}</span>
+        </div>
+      </div>
+
+      {/* Messages */}
+      <div style={messagesStyle}>
+        {messages.length === 0 && (
+          <div style={{ textAlign: "center", color: "#999", padding: "20px" }}>
+            {isConnected
+              ? "Start a conversation with the agent..."
+              : isConnecting
+              ? "Connecting to agent..."
+              : "Not connected. Please check the agent service."}
+          </div>
+        )}
+        {messages.map((msg, index) => (
+          <div key={index} style={messageStyle(msg.sender)}>
+            {msg.text}
+          </div>
+        ))}
+        <div ref={messagesEndRef} />
+      </div>
+
+      {/* Input */}
+      <div style={inputContainerStyle}>
+        <input
+          type="text"
+          value={inputMessage}
+          onChange={(e) => setInputMessage(e.target.value)}
+          onKeyPress={handleKeyPress}
+          placeholder={isConnected ? "Type a message..." : "Not connected"}
+          disabled={!isConnected}
+          style={inputStyle}
+        />
+        <button onClick={sendMessage} disabled={!isConnected} style={buttonStyle}>
+          Send
+        </button>
+      </div>
+    </div>
+  );
+};
